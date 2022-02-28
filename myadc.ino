@@ -1,4 +1,11 @@
+#include <stdio.h>
+#include <string.h>
+
+#include <can.h>
+#include <mcp2515.h>
+
 #include <EEPROM.h>
+#include <SPI.h>
 
 /* ---------------------------------------------------------------------------- */
 /* ---- define constants  ----------------------------------------------------- */
@@ -21,7 +28,7 @@
 #define dprint(...)
 #endif
 
-/* magic value to init the state machine */
+/* magic value to init the program state machine */
 #define INIT_STATE          0x2f
 
 /* serial transmit/receive buffer size */
@@ -50,12 +57,32 @@
 /* step3: normal average decimated adc values for the white noise removal */
 #define ADC_NORMAL_AVERAGE  (byte)8
 
+/* define can bus SPI chip select pin */
+#define CAN_CS_PIN          10
+/* define can bus interrupt pin */
+#define CAN_INTR_PIN        2
+/* use a free adc channel as a seed for the random number generator */
+#define CAN_RAND_ADC        4
+/* define maximum number of ECUs that are supported on a can bus network */
+#define CAN_MAX_NODES       24
+#define CAN_PERNODE_MSGIDS	TOTAL_ADC
+#define CAN_ALLNODES_MSGIDS	(CAN_MAX_NODES * CAN_PERNODE_MSGIDS)
+#define CAN_MASTER_MSGIDS	5
+#define CAN_TOTAL_MSGIDS	(CAN_MASTER_MSGIDS + CAN_ALLNODES_MSGIDS)
+/* standard can bus network supports 11 bits message identifiers */
+#define CAN_VALID_MSGIDS	0x7ff
+/* define min and max can bus message identifiers */
+#define CAN_MIN_MSGID       1
+#define CAN_MAX_MSGID       (CAN_VALID_MSGIDS - CAN_TOTAL_MSGIDS)
+/* define to find a free message identifier from CAN_ALLNODES_MSGIDS */
+#define CAN_NODE_FREE		0x7ff
+
 /* ---------------------------------------------------------------------------- */
 /* ---- user defined data types ----------------------------------------------- */
 /* enum type defines program states */
 typedef enum {
   PR_START = INIT_STATE,
-  PR_POLL_SERIAL_RX,
+  PR_POLL_RECEIVE,
   PR_CALIBRATE,
   PR_ADC_READ,
   PR_ADC_FINISH,
@@ -94,6 +121,25 @@ typedef struct {
   byte chan;
 } adc_t;
 
+/* enum type defines can bus states */
+typedef enum {
+  /* following states till CAN_CMD_LAST send defined data on can bus.
+   * CAN_CMD_ADC_SEND states sends an adc channel's data on can bus.
+   * CAN_CMD_TRANSIT state represents a can message was transmitted.  
+   */
+  CAN_CMD_MASTER_REG = 0,
+  CAN_CMD_SLAVE_REG,
+  CAN_CMD_MASTER_SET,
+  CAN_CMD_LAST,
+  CAN_CMD_SLAVE_SET,
+  CAN_CMD_ADC_SEND,
+  CAN_CMD_TRANSIT,
+  CAN_ROLE_START,
+  CAN_ROLE_MASTER,
+  CAN_ROLE_SLAVE,
+  CAN_ROLE_LAST,
+} can_cmd_id_t;
+
 /* ---------------------------------------------------------------------------- */
 /* ---- function prototypes --------------------------------------------------- */
 static void ser_cmd_adc_calibrate(void);
@@ -122,6 +168,38 @@ static byte cur_adc;
 
 /* counts accumulated adc samples */
 static word adc_samples;
+
+/* allocate can bus library object */
+MCP2515 mcp2515(CAN_CS_PIN);
+/* add can bus commands.
+ * a command of exactly 8 bytes is supported on the can bus network.
+ * add char # in place of an unused byte.
+ */
+static byte can_cmds[CAN_CMD_LAST][CAN_MAX_DLEN] = {
+  /*
+  {'0', '1', '2', '3', '4', '5', '6', '7'},
+  */
+  {'M', 'S', 'T', '#', 'R', 'E', 'G', '#'}, /* master register command */
+  {'S', 'L', 'V', '#', 'R', 'E', 'G', '#'}, /* slave register command */
+  {'M', 'S', 'T', '#', 'S', 'E', 'T', '#'}, /* master set command */
+};
+/* detects can bus interrupt */
+static byte canbus_intr = 0;
+/* stores can bus state */
+static can_cmd_id_t can_state;
+/* store a can bus node's role as a master or slave */
+static can_cmd_id_t can_role;
+/* allocate can bus frames */
+static struct can_frame can_tx;
+static struct can_frame can_ans;
+/* stores a start message identifier that a master node uses to register can nodes */
+static canid_t can_start_msgid;
+/* stores message identifiers of registered slaves on a master node */
+static canid_t can_init_msgids[CAN_MAX_NODES];
+/* stores message identifiers of adc data sending can nodes */
+static canid_t can_adc_msgids[CAN_ALLNODES_MSGIDS];
+/* stores adc data from each can node */
+static double can_adc_data[CAN_ALLNODES_MSGIDS];
 
 /* ---------------------------------------------------------------------------- */
 /* ---- interrupt routines ---------------------------------------------------- */
@@ -154,6 +232,10 @@ ISR(ADC_vect)
   }
 }
 
+void canbus_intr_cb(void) {
+  canbus_intr++;
+}
+
 /* ---------------------------------------------------------------------------- */
 /* ---- user code ------------------------------------------------------------- */
 static void eeprom_read(void) {
@@ -181,7 +263,7 @@ static void serial_read(ser_cmd_id_t ser_cmd_id) {
   static byte rx_match_idx = 0;
   char *ser_cmd_str = NULL;
   
-  /* handle invalid input arguments */
+  /* handle invalid input argument */
   if (ser_cmd_id < 0 || ser_cmd_id >= SER_CMD_LAST) {
     /* discard received bytes before a next read on the serial bus */
     while ((UCSR0A & (1 << RXC0)) != 0) {
@@ -229,6 +311,171 @@ static void serial_read(ser_cmd_id_t ser_cmd_id) {
   }
 }
 
+static void canbus_handler(can_cmd_id_t can_cmd_id) {
+  struct can_frame *can_p = NULL;
+  byte irq;
+  MCP2515::RXBn rx_sel;
+  boolean rx_intr = false;
+  static byte can_mst_reg_cnt = 0;
+  
+  /* handle valid input argument */
+  if ((can_cmd_id >= CAN_CMD_MASTER_REG && can_cmd_id < CAN_ROLE_LAST))
+  {
+    /* select a can frame to transmit */
+    can_p = &can_ans;
+    if (can_cmd_id <= CAN_CMD_SLAVE_REG) {
+      can_p = &can_tx;
+    }
+    
+    /* handle can bus tx */
+    if (can_cmd_id < CAN_CMD_TRANSIT) {
+      /* select data of a can frame */
+      if (can_cmd_id <= CAN_CMD_MASTER_SET) {
+        memcpy(can_p->data, can_cmds[can_cmd_id], CAN_MAX_DLEN);
+      }
+      
+      /* send a can frame */
+      while (mcp2515.sendMessage(can_p) != MCP2515::ERROR_OK) {
+        delay(100);
+      }
+      
+      /* update can master register count after sending of a can frame */
+      if (can_state == CAN_CMD_MASTER_REG) {
+        can_mst_reg_cnt++;
+      }
+      
+      /* mark sending of a can frame */
+      can_state = CAN_CMD_TRANSIT;
+    }
+    
+    /* exit if there is no interrupt to handle */
+    if (canbus_intr == 0) {
+      return;
+    }
+    
+    /* check can bus interrupt */
+    irq = mcp2515.getInterrupts();
+    if (irq & MCP2515::CANINTF_RX0IF) {
+      rx_sel = MCP2515::RXB0;
+      rx_intr = true;
+    }
+    if (irq & MCP2515::CANINTF_RX1IF) {
+      rx_sel = MCP2515::RXB1;
+      rx_intr = true;
+    }
+    
+    /* handle can bus rx */
+    if (rx_intr == true && (mcp2515.readMessage(rx_sel, &can_ans) == MCP2515::ERROR_OK)) {
+      if (memcmp(can_ans.data, can_cmds[CAN_CMD_MASTER_REG], CAN_MAX_DLEN) == 0) {
+        /* handle a can master register */
+        if (can_role == CAN_ROLE_START) {
+          /* update can master register count after receiving of a can frame */
+          can_mst_reg_cnt++;
+          if (can_mst_reg_cnt >= 2) {
+            /* a master role is assumed if a can node detects two master register can frames */
+            can_role = CAN_ROLE_MASTER;
+          }
+        }
+        if (can_role == CAN_ROLE_MASTER) {
+          /* send a can message that a can master exists with the highest priority message identifier 0 */
+          can_ans.can_id = 0;
+          can_state = CAN_CMD_MASTER_SET;
+        }
+      } else if (memcmp(can_ans.data, can_cmds[CAN_CMD_MASTER_SET], CAN_MAX_DLEN) == 0) {
+        /* handle a can master set */
+        if (can_role == CAN_ROLE_START) {
+          /* reset can master register count */
+          can_mst_reg_cnt = 0;
+          /* send a can message to register as a slave */
+          can_state = CAN_CMD_SLAVE_REG;
+        }
+      } else if (memcmp(can_ans.data, can_cmds[CAN_CMD_SLAVE_REG], CAN_MAX_DLEN) == 0) {
+        /* handle a can slave register */
+        if (can_role == CAN_ROLE_MASTER) {
+          /* send a can message to set a master assigned message identifier as a slave
+           * with the highest priority message identifier 0.
+           */
+          can_ans.can_dlc = 4;
+          can_ans.can_id = 0;
+          for (int idx = 0; idx < CAN_MAX_NODES; idx++) {
+		  }
+            if (pool_can_id[idx][0] == 0) {
+              pool_can_id[idx][0] = can_ans.can_id;
+              pool_can_id[idx][1] = can_start_msgid;
+              pool_can_id[idx][1] = can_start_msgid + ADCY;
+              pool_can_id[idx][1] = can_start_msgid + ADC;
+              /* update master side message identifier for assigning to a next can node.
+               * CAN_PERNODE_MSGIDS is added for the message identifier of each adc channel's data.
+               */
+              can_start_msgid += CAN_PERNODE_MSGIDS;
+            }
+            if (can_ans.can_id == pool_can_id[idx][0]) {
+              /* select data of a can frame */
+              memcpy(can_ans.data, &pool_can_id[idx][0], can_ans.can_dlc);
+              break;
+            }
+          }
+          /* protocol handles at maximum CAN_TOTAL_MSGIDS message identifiers */
+          if (can_free_id >= CAN_TOTAL_MSGIDS) {
+            /* send can error message */
+          }
+          can_state = CAN_CMD_SLAVE_SET;
+        }
+      } else if (can_ans.can_dlc == 4 && can_ans.can_id == 0) {
+        /* handle a can slave set */
+        int data[2];
+        memcpy(data, can_ans.data, can_ans.can_dlc);
+        if (data[0] == can_tx.can_id) {
+          can_tx.can_id = data[1];
+          can_role = CAN_ROLE_SLAVE;
+        }
+      } else {
+        /* handle can adc data receive */
+          for (int idx = 0; idx < CAN_MAX_NODES; idx++) {
+          if (can_ans.can_id == can_pool_can_id[idx][1] ||
+              == can_ans.can_id) {
+            memcpy(can_adc_data[idx], 
+            pool_can_id[idx][0] = can_ans.can_id;
+            pool_can_id[idx][1] = can_free_id;
+            /* update master side message identifier for assigning to a next slave.
+             * 3 is added for the message identifier of each adc channel's data.
+             */
+            can_free_id += 3;
+          }
+          if (can_ans.can_id == pool_can_id[idx][0]) {
+            /* select data of a can frame */
+            memcpy(can_ans.data, &pool_can_id[idx][0], can_ans.can_dlc);
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+
+static void canbus_init(void) {
+  /* init random number generator */
+  randomSeed(analogRead(CAN_RAND_ADC));
+  
+  /* init can bus */
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_125KBPS);
+  mcp2515.setNormalMode();
+  can_tx.can_id = random(CAN_MIN_MSGID, CAN_MAX_MSGID);
+  can_tx.can_dlc = CAN_MAX_DLEN;
+  can_start_msgid = can_tx.can_id + CAN_MASTER_MSGIDS;
+  
+  /* init can shared variables */
+  can_state = CAN_CMD_MASTER_REG;
+  can_role = CAN_ROLE_START;
+  canbus_intr = 0;
+  memset(can_init_msgids, 0, sizeof(canid_t));
+  for (int idx = 0; idx < CAN_MAX_NODES; idx++) {
+	can_adc_msgids[idx] = CAN_NODE_FREE;
+  }
+  memset(can_adc_data, 0, sizeof(can_adc_data));
+}
+
 void setup() {
   /* setup serial */
   Serial.begin(115200);
@@ -253,6 +500,11 @@ void setup() {
   adc_channels[ADCX].chan = ADCX;
   adc_channels[ADCY].chan = ADCY;
   adc_channels[ADCZ].chan = ADCZ;
+
+  /* setup canbus */
+  /* enable can bus interrupt */
+  pinMode(CAN_INTR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(CAN_INTR_PIN), canbus_intr_cb, FALLING);
   
   /* get adc calibration parameters from eeprom */
   eeprom_read();
@@ -274,6 +526,9 @@ void loop() {
   
   /* init state machine */
   cur_state = PR_START;
+
+  /* init can bus */
+  canbus_init();
   
   /* state machine */
   dprint("starting state machine...");
@@ -287,10 +542,22 @@ void loop() {
           adc_nbit[cur_adc] = 0;
         }
         
+        /* set a can bus node as a master or slave.
+         * a can bus node that succeeds first in sending the can master register command assumes the mater role.
+         * other can bus nodes request their slave message identifier from a master node.  
+         */
+        do {
+          canbus_handler(can_state);
+        } while (can_role == CAN_ROLE_START);
+        
         /* set next state */
         cur_state = PR_ADC_READ;
         break;
-      case PR_POLL_SERIAL_RX:
+      case PR_POLL_RECEIVE:
+        while (canbus_intr > 0) {
+          canbus_handler(can_state);
+          canbus_intr = canbus_intr - 1;
+        }
         serial_read(SER_CMD_ADC_CALIBRATE);
         break;
       case PR_CALIBRATE:
@@ -316,7 +583,7 @@ void loop() {
         break;
       case PR_ADC_READ:
         /* set next state */
-        cur_state = PR_POLL_SERIAL_RX;
+        cur_state = PR_POLL_RECEIVE;
         
         /* init adc channel */
         adc_samples = 0;
@@ -369,6 +636,17 @@ void loop() {
           DTOSTR(adc_nbit[ADCX]),
           DTOSTR(adc_nbit[ADCY]),
           DTOSTR(adc_nbit[ADCZ]));
+        
+        for (cur_adc = ADCX; cur_adc <= ADCZ; cur_adc++) {
+          /* wait until can transmit channel is free */
+          while (can_state != CAN_CMD_TRANSIT) {
+            canbus_handler(can_state);
+          }
+          /* send an adc channel data on a can bus */
+          can_ans.can_id = can_tx.can_id + cur_adc;
+          memcpy(can_ans.data, adc_nbit[cur_adc], sizeof(double));
+          canbus_handler(CAN_CMD_ADC_SEND);
+        }
         
         /* set next state */
         cur_state = PR_START;
